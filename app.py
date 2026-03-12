@@ -75,7 +75,7 @@ def _q(tag):
     return f"{{{NS}}}{tag}"
 
 def _local(elem):
-    return etree.QName(elem).localname
+    return etree.QName(elem.tag).localname
 
 def _is_nil(elem):
     return elem.get(f"{{{XSI}}}nil", "false").lower() == "true"
@@ -253,7 +253,9 @@ def _feature_has_geometry(elem):
 
 def discover_feature_classes(root):
     found, seen = [], set()
-    for container in root.iter():
+    for container in root.iter(etree.Element):
+        if not isinstance(container.tag, str):
+            continue  # skip comments, PIs
         c_local = _local(container)
         if c_local in seen:
             continue
