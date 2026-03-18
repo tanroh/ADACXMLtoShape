@@ -80,6 +80,213 @@ def _local(elem):
 def _is_nil(elem):
     return elem.get(f"{{{XSI}}}nil", "false").lower() == "true"
 
+# ─── VALIDATION ───────────────────────────────────────────────────────────────
+#
+# Each check appends dicts to a findings list:
+#   { "code": str, "feature": str, "field": str, "message": str }
+#
+# All findings are warnings — conversion always proceeds.
+
+# Project header fields we expect to be present and non-empty
+_HEADER_FIELDS = ["ProjectName", "ProjectNumber", "Surveyor", "SurveyDate"]
+
+# Dimension fields (mm or m) that must be positive when present
+_DIM_FIELDS_MM = [
+    "Diameter_mm", "InternalDiameter_mm", "ShaftSizeDiameter_mm",
+    "RiserDiameter_mm", "BodySize_mm", "BranchSize_mm", "Width_mm",
+]
+_DIM_FIELDS_M = [
+    "Length_m", "Depth_m", "Offset_m", "Alignment_m", "TieDistance_m",
+    "OffsetDistance_m", "IO_Distance_m", "SO_Nearest_m", "SO_Other_m",
+    "Volume_m3", "SemiMajor", "SemiMinor", "LinedWidth_m", "BaseWidth_m",
+    "BatterWidth_m",
+]
+
+# MGA zone approximate easting/northing bounds (metres)
+# Easting: all MGA zones share 100 000–900 000 (false easting 500 000 ± 400 000)
+# Northing (southern hemisphere): 1 000 000–10 000 000
+_MGA_EASTING_MIN  =  100_000.0
+_MGA_EASTING_MAX  =  900_000.0
+_MGA_NORTHING_MIN =1_000_000.0
+_MGA_NORTHING_MAX =10_100_000.0  # slight buffer for AHD vs ellipsoidal
+
+
+def _get_text(elem, tag):
+    """Return stripped text of a direct child tag, or None."""
+    child = elem.find(_q(tag))
+    if child is None or child.text is None:
+        return None
+    return child.text.strip() or None
+
+
+def _feature_id(feat):
+    """Best available identifier for a feature, for display in warnings."""
+    for tag in ("ADACId", "ComponentID", "AssetID", "PitNumber", "MH_Number"):
+        val = _get_text(feat, tag)
+        if val:
+            return val
+    return f"<{_local(feat)}>"
+
+
+def validate_adac(root, filename):
+    """
+    Run all validation checks against a parsed ADAC XML root.
+
+    Returns list of finding dicts:
+        { "code": str, "feature": str, "field": str, "message": str }
+    """
+    findings = []
+
+    def warn(code, feature, field, message):
+        findings.append({
+            "code":    code,
+            "feature": feature,
+            "field":   field,
+            "message": message,
+        })
+
+    # ── 1. Project header ─────────────────────────────────────────────────────
+    project = root.find(f".//{_q('Project')}")
+    for field in _HEADER_FIELDS:
+        val = _get_text(project, field) if project is not None else None
+        if not val:
+            warn("MISSING_HEADER", "Project", field,
+                 f"Project header field <{field}> is missing or empty.")
+
+    # ── 2. Coordinate reference system ────────────────────────────────────────
+    cs = root.find(f".//{_q('CoordinateSystem')}")
+    if cs is None:
+        warn("MISSING_CRS", "Project", "CoordinateSystem",
+             "No <CoordinateSystem> element found. WGS84 or user-specified fallback will be used.")
+    else:
+        hcs   = _get_text(cs, "HorizontalCoordinateSystem")
+        datum = _get_text(cs, "HorizontalDatum")
+
+        if not hcs:
+            warn("MISSING_CRS", "Project", "HorizontalCoordinateSystem",
+                 "<HorizontalCoordinateSystem> is empty — cannot auto-detect MGA zone.")
+        else:
+            zone = _re.search(r'(?<![0-9])(5[4-8])(?![0-9])', hcs)
+            if zone is None:
+                warn("UNRECOGNISED_CRS", "Project", "HorizontalCoordinateSystem",
+                     f"Cannot parse an MGA zone (54–58) from '{hcs}'. "
+                     f"Fallback projection will be used.")
+
+        if not datum:
+            warn("MISSING_CRS", "Project", "HorizontalDatum",
+                 "<HorizontalDatum> is empty — cannot distinguish GDA94 from GDA2020.")
+
+        approx = _get_text(cs, "IsApproximate")
+        if approx and approx.lower() == "true":
+            warn("APPROX_CRS", "Project", "IsApproximate",
+                 "CoordinateSystem is marked as approximate.")
+
+    # ── 3. Per-feature checks ─────────────────────────────────────────────────
+    seen_ids = {}   # ADACId → first container where seen
+
+    for container in root.iter(etree.Element):
+        if not isinstance(container.tag, str):
+            continue
+        c_name = _local(container)
+        children = list(container)
+        if not children:
+            continue
+        # Only process containers whose children all carry <Geometry>
+        # (same heuristic as discover_feature_classes)
+        if not all(c.find(_q("Geometry")) is not None for c in children):
+            continue
+        unique_tags = {_local(c) for c in children}
+        if next(iter(unique_tags)) == c_name:
+            continue
+
+        for feat in children:
+            fid = _feature_id(feat)
+            flabel = f"{c_name} / {fid}"
+
+            # 3a. Missing geometry
+            geom = feat.find(_q("Geometry"))
+            if geom is None or len(geom) == 0:
+                warn("MISSING_GEOMETRY", flabel, "Geometry",
+                     "Feature has no <Geometry> element.")
+
+            # 3b. Coordinates in plausible MGA range (only check if CRS looks projected)
+            if geom is not None:
+                for pos_tag in ("Point", "Vertex", "FromPoint", "ToPoint", "CentrePoint"):
+                    for pos in geom.iter(_q(pos_tag)):
+                        x_el = pos.find(_q("X"))
+                        y_el = pos.find(_q("Y"))
+                        if x_el is not None and x_el.text and y_el is not None and y_el.text:
+                            try:
+                                x = float(x_el.text)
+                                y = float(y_el.text)
+                                if not (_MGA_EASTING_MIN <= x <= _MGA_EASTING_MAX):
+                                    warn("COORD_RANGE", flabel, "X",
+                                         f"X coordinate {x:.3f} is outside the expected MGA "
+                                         f"easting range ({_MGA_EASTING_MIN:,.0f}–"
+                                         f"{_MGA_EASTING_MAX:,.0f} m). "
+                                         f"Check CRS or coordinate units.")
+                                    break  # one warning per feature is enough
+                                if not (_MGA_NORTHING_MIN <= y <= _MGA_NORTHING_MAX):
+                                    warn("COORD_RANGE", flabel, "Y",
+                                         f"Y coordinate {y:.3f} is outside the expected MGA "
+                                         f"northing range ({_MGA_NORTHING_MIN:,.0f}–"
+                                         f"{_MGA_NORTHING_MAX:,.0f} m). "
+                                         f"Check CRS or coordinate units.")
+                                    break
+                            except ValueError:
+                                pass
+                        break  # only check first position element per feature
+
+            # 3c. Duplicate ADACId
+            adac_id = _get_text(feat, "ADACId")
+            if adac_id:
+                if adac_id in seen_ids:
+                    warn("DUPLICATE_ID", flabel, "ADACId",
+                         f"ADACId '{adac_id}' already seen in {seen_ids[adac_id]}.")
+                else:
+                    seen_ids[adac_id] = c_name
+
+            # 3d. Negative or zero dimensions
+            for field in _DIM_FIELDS_MM + _DIM_FIELDS_M:
+                val_text = _get_text(feat, field)
+                if val_text is None:
+                    continue
+                try:
+                    val = float(val_text)
+                    if val <= 0:
+                        unit = "mm" if field in _DIM_FIELDS_MM else "m"
+                        warn("NEGATIVE_DIM", flabel, field,
+                             f"<{field}> = {val} {unit} — must be positive.")
+                except ValueError:
+                    warn("INVALID_DIM", flabel, field,
+                         f"<{field}> = '{val_text}' is not a valid number.")
+
+            # 3e. Invert level above surface level
+            surf_text   = _get_text(feat, "SurfaceLevel_m")
+            inv_text    = _get_text(feat, "InvertLevel_m")
+            us_inv_text = _get_text(feat, "US_InvertLevel_m")
+            ds_inv_text = _get_text(feat, "DS_InvertLevel_m")
+
+            def _check_invert(surf_t, inv_t, inv_label):
+                if surf_t is None or inv_t is None:
+                    return
+                try:
+                    surf = float(surf_t)
+                    inv  = float(inv_t)
+                    if inv >= surf:
+                        warn("INVERT_ABOVE_SURFACE", flabel, inv_label,
+                             f"{inv_label} ({inv:.3f} m) ≥ SurfaceLevel ({surf:.3f} m). "
+                             f"Expected invert to be below surface.")
+                except ValueError:
+                    pass
+
+            _check_invert(surf_text, inv_text,    "InvertLevel_m")
+            _check_invert(surf_text, us_inv_text, "US_InvertLevel_m")
+            _check_invert(surf_text, ds_inv_text, "DS_InvertLevel_m")
+
+    return findings
+
+
 # ─── GEOMETRY PARSING ─────────────────────────────────────────────────────────
 
 def _read_position(elem):
@@ -441,7 +648,7 @@ def convert_adac_xml(xml_bytes, filename, output_dir, prj_override_mode,
                      prj_override_datum, prj_override_zone, geom_filter):
     """
     Convert one ADAC XML (as bytes) → shapefiles in output_dir/stem/.
-    Returns (summary_list, log_lines, crs_info_dict).
+    Returns (summary_list, log_lines, crs_info_dict, findings_list).
     """
     log = []
     stem = Path(filename).stem
@@ -449,7 +656,10 @@ def convert_adac_xml(xml_bytes, filename, output_dir, prj_override_mode,
     try:
         root = etree.fromstring(xml_bytes)
     except Exception as e:
-        return [], [f"[ERROR] XML parse failed: {e}"], {}
+        return [], [f"[ERROR] XML parse failed: {e}"], {}, []
+
+    # Run validation before conversion
+    findings = validate_adac(root, filename)
 
     crs = read_coordinate_system(root)
     crs_info = {}
@@ -477,7 +687,7 @@ def convert_adac_xml(xml_bytes, filename, output_dir, prj_override_mode,
     feature_classes = discover_feature_classes(root)
     if not feature_classes:
         log.append("  [WARN] No ADAC feature classes discovered.")
-        return [], log, crs_info
+        return [], log, crs_info, findings
 
     log.append(f"Discovered {len(feature_classes)} container(s): "
                f"{[fc['container'] for fc in feature_classes]}")
@@ -508,7 +718,7 @@ def convert_adac_xml(xml_bytes, filename, output_dir, prj_override_mode,
                 "path": out_stem,
             })
 
-    return summary, log, crs_info
+    return summary, log, crs_info, findings
 
 
 def zip_output_dir(output_dir):
@@ -608,9 +818,10 @@ if not run:
 
 # ── Run conversion ────────────────────────────────────────────────────────────
 tmpdir = tempfile.mkdtemp()
-all_summary = []
-all_logs    = {}
-all_crs     = {}
+all_summary  = []
+all_logs     = {}
+all_crs      = {}
+all_findings = {}
 
 progress = st.progress(0, text="Starting…")
 total = len(uploaded_files)
@@ -618,13 +829,14 @@ total = len(uploaded_files)
 for i, uf in enumerate(uploaded_files):
     progress.progress((i) / total, text=f"Processing {uf.name}…")
     xml_bytes = uf.read()
-    summary, log, crs_info = convert_adac_xml(
+    summary, log, crs_info, findings = convert_adac_xml(
         xml_bytes, uf.name, tmpdir,
         prj_mode, override_datum, override_zone, geom_filter,
     )
     all_summary.extend(summary)
-    all_logs[uf.name]  = log
-    all_crs[uf.name]   = crs_info
+    all_logs[uf.name]      = log
+    all_crs[uf.name]       = crs_info
+    all_findings[uf.name]  = findings
 
 progress.progress(1.0, text="Done!")
 
@@ -647,7 +859,60 @@ else:
 
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    # Download button
+
+    # ── Validation Report ────────────────────────────────────────────────────
+    all_findings_flat = []
+    for fname, findings in all_findings.items():
+        for f in findings:
+            all_findings_flat.append({**f, "file": fname})
+
+    total_warnings = len(all_findings_flat)
+
+    st.subheader("3. Validation Report")
+
+    if total_warnings == 0:
+        st.success("✅ No validation issues found.")
+    else:
+        # Group by code for the summary banner
+        from collections import Counter
+        code_counts = Counter(f["code"] for f in all_findings_flat)
+        summary_parts = ", ".join(
+            f"{count}× {code}" for code, count in sorted(code_counts.items())
+        )
+        st.warning(f"⚠️ {total_warnings} warning(s) found — conversion proceeded. ({summary_parts})")
+
+        # Collapsible detail table per file
+        for fname, findings in all_findings.items():
+            if not findings:
+                continue
+            with st.expander(f"{fname}  —  {len(findings)} warning(s)", expanded=True):
+                vdf = pd.DataFrame(findings)[["code", "feature", "field", "message"]]
+                vdf.columns = ["Code", "Feature", "Field", "Detail"]
+
+                # Colour-code by category
+                def _row_style(row):
+                    palette = {
+                        "MISSING_CRS":          "background-color: #fff3cd",
+                        "UNRECOGNISED_CRS":      "background-color: #fff3cd",
+                        "APPROX_CRS":            "background-color: #fff3cd",
+                        "MISSING_HEADER":        "background-color: #e8f4fd",
+                        "MISSING_GEOMETRY":      "background-color: #fdecea",
+                        "COORD_RANGE":           "background-color: #fdecea",
+                        "NEGATIVE_DIM":          "background-color: #fdecea",
+                        "INVALID_DIM":           "background-color: #fdecea",
+                        "INVERT_ABOVE_SURFACE":  "background-color: #fdecea",
+                        "DUPLICATE_ID":          "background-color: #f0e6ff",
+                    }
+                    colour = palette.get(row["Code"], "")
+                    return [colour] * len(row)
+
+                st.dataframe(
+                    vdf.style.apply(_row_style, axis=1),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    # ── Download ─────────────────────────────────────────────────────────────
     st.subheader("4. Download")
     zip_bytes = zip_output_dir(tmpdir)
     st.download_button(
