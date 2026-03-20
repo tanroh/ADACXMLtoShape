@@ -747,7 +747,7 @@ with st.sidebar:
         help="Auto-detect reads the CRS from each XML file. Override forces a specific projection.",
     )
 
-    override_datum = "GDA2020"
+    override_datum = "GDA94"
     override_zone  = 55
 
     if crs_mode == "Override":
